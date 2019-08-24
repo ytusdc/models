@@ -48,7 +48,9 @@ import tensorflow as tf
 
 from tensorflow.contrib.slim.nets import resnet_utils
 
-slim = tf.contrib.slim
+import tensorflow.contrib.slim as slim
+
+# slim = tf.contrib.slim
 
 
 _DEFAULT_MULTI_GRID = [1, 1, 1]
