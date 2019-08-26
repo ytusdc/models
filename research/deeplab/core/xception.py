@@ -73,7 +73,7 @@ class Block(collections.namedtuple('Block', ['scope', 'unit_fn', 'args'])):
 
 def fixed_padding(inputs, kernel_size, rate=1):
   """Pads the input along the spatial dimensions independently of input size.
-
+    沿着空间维度填充输入，与输入大小无关。
   Args:
     inputs: A tensor of size [batch, height_in, width_in, channels].
     kernel_size: The kernel to be used in the conv2d or max_pool2d operation.
