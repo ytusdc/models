@@ -48,15 +48,10 @@ import tensorflow as tf
 
 from tensorflow.contrib.slim.nets import resnet_utils
 
-<<<<<<< Updated upstream
-import tensorflow.contrib.slim as slim
 
-# slim = tf.contrib.slim
-=======
 # slim = tf.contrib.slim
 
 import tensorflow.contrib.slim as slim
->>>>>>> Stashed changes
 
 
 _DEFAULT_MULTI_GRID = [1, 1, 1]
