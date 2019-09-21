@@ -26,14 +26,14 @@ import json
 import os
 
 # pylint: disable=g-bad-import-order
-from absl import app as absl_app
+from absl import app
 from absl import flags
 from absl import logging
 import tensorflow as tf
 # pylint: enable=g-bad-import-order
 
-from official.datasets import movielens
 from official.recommendation import constants as rconst
+from official.recommendation import movielens
 from official.recommendation import ncf_common
 from official.recommendation import ncf_input_pipeline
 from official.recommendation import neumf_model
@@ -42,6 +42,7 @@ from official.utils.logs import mlperf_helper
 from official.utils.misc import distribution_utils
 from official.utils.misc import keras_utils
 from official.utils.misc import model_helpers
+from official.utils.flags import core as flags_core
 from official.utils.misc import tpu_lib
 
 FLAGS = flags.FLAGS
@@ -253,7 +254,10 @@ def run_ncf(_):
         "val_HR_METRIC", desired_value=FLAGS.hr_threshold)
     callbacks.append(early_stopping_callback)
 
-  with tf.device(tpu_lib.get_primary_cpu_task(params["use_tpu"])):
+  use_remote_tpu = params["use_tpu"] and FLAGS.tpu
+  primary_cpu_task = tpu_lib.get_primary_cpu_task(use_remote_tpu)
+
+  with tf.device(primary_cpu_task):
     (train_input_dataset, eval_input_dataset,
      num_train_steps, num_eval_steps) = \
       (ncf_input_pipeline.create_ncf_input_data(
@@ -267,6 +271,12 @@ def run_ncf(_):
           beta_1=params["beta1"],
           beta_2=params["beta2"],
           epsilon=params["epsilon"])
+      if FLAGS.dtype == "fp16":
+        optimizer = \
+          tf.compat.v1.train.experimental.enable_mixed_precision_graph_rewrite(
+              optimizer,
+              loss_scale=flags_core.get_loss_scale(FLAGS,
+                                                   default_for_fp16="dynamic"))
 
       if params["keras_use_ctl"]:
         train_loss, eval_results = run_ncf_custom_training(
@@ -371,8 +381,12 @@ def run_ncf_custom_training(params,
             softmax_logits,
             sample_weight=features[rconst.VALID_POINT_MASK])
         loss *= (1.0 / params["batch_size"])
+        if FLAGS.dtype == "fp16":
+          loss = optimizer.get_scaled_loss(loss)
 
       grads = tape.gradient(loss, keras_model.trainable_variables)
+      if FLAGS.dtype == "fp16":
+        grads = optimizer.get_unscaled_gradients(grads)
       # Converting gradients to dense form helps in perf on GPU for NCF
       grads = neumf_model.sparse_to_dense_grads(
           list(zip(grads, keras_model.trainable_variables)))
@@ -506,4 +520,4 @@ def main(_):
 
 if __name__ == "__main__":
   ncf_common.define_ncf_flags()
-  absl_app.run(main)
+  app.run(main)

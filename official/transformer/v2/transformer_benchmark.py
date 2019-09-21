@@ -43,6 +43,7 @@ class TransformerBenchmark(PerfZeroBenchmark):
 
   def __init__(self, output_dir=None, default_flags=None, root_data_dir=None,
                flag_methods=None):
+    assert tf.version.VERSION.startswith('2.')
     self.train_data_dir = os.path.join(root_data_dir,
                                        TRANSFORMER_EN2DE_DATA_DIR_NAME)
 
@@ -58,8 +59,8 @@ class TransformerBenchmark(PerfZeroBenchmark):
                                  EN2DE_2014_BLEU_DATA_DIR_NAME,
                                  'newstest2014.de')
 
-    default_flags['train_steps'] = 200
-    default_flags['log_steps'] = 10
+    if default_flags is None:
+      default_flags = {}
     default_flags['data_dir'] = self.train_data_dir
     default_flags['vocab_file'] = self.vocab_file
 
@@ -344,6 +345,30 @@ class TransformerBigKerasAccuracy(TransformerBenchmark):
                                    bleu_min=28,
                                    bleu_max=29.2)
 
+  def benchmark_8_gpu_fp16_amp(self):
+    """Benchmark 8 gpu with dynamic batch and fp16 with automatic mixed precision.
+
+      Should converge to 28.4 BLEU (uncased). This has not be verified yet."
+    """
+    self._setup()
+    FLAGS.num_gpus = 8
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
+    FLAGS.data_dir = self.train_data_dir
+    FLAGS.vocab_file = self.vocab_file
+    # Sets values directly to avoid validation check.
+    FLAGS['bleu_source'].value = self.bleu_source
+    FLAGS['bleu_ref'].value = self.bleu_ref
+    FLAGS.param_set = 'big'
+    FLAGS.batch_size = 3072*8
+    FLAGS.train_steps = 20000 * 12
+    FLAGS.steps_between_evals = 20000
+    FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu_fp16_amp')
+    self._run_and_report_benchmark(total_batch_size=FLAGS.batch_size,
+                                   log_steps=FLAGS.log_steps,
+                                   bleu_min=28,
+                                   bleu_max=29)
+    
   def benchmark_8_gpu_static_batch_fp16(self):
     """Benchmark 8 gpu with static batch and fp16.
 
@@ -628,6 +653,8 @@ class TransformerBaseKerasBenchmarkReal(TransformerKerasBenchmark):
   def __init__(self, output_dir=TMP_DIR, root_data_dir=None, **kwargs):
     def_flags = {}
     def_flags['param_set'] = 'base'
+    def_flags['train_steps'] = 50
+    def_flags['log_steps'] = 10
 
     super(TransformerBaseKerasBenchmarkReal, self).__init__(
         output_dir=output_dir, default_flags=def_flags,
@@ -640,6 +667,8 @@ class TransformerBigKerasBenchmarkReal(TransformerKerasBenchmark):
   def __init__(self, output_dir=TMP_DIR, root_data_dir=None, **kwargs):
     def_flags = {}
     def_flags['param_set'] = 'big'
+    def_flags['train_steps'] = 50
+    def_flags['log_steps'] = 10
 
     super(TransformerBigKerasBenchmarkReal, self).__init__(
         output_dir=output_dir, default_flags=def_flags,

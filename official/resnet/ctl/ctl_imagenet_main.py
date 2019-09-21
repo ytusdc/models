@@ -26,7 +26,6 @@ import tensorflow as tf
 from official.resnet.ctl import ctl_common
 from official.vision.image_classification import imagenet_preprocessing
 from official.vision.image_classification import common
-from official.vision.image_classification import resnet_imagenet_main
 from official.vision.image_classification import resnet_model
 from official.utils.flags import core as flags_core
 from official.utils.logs import logger
@@ -141,8 +140,6 @@ def run(flags_obj):
       enable_eager=flags_obj.enable_eager,
       enable_xla=flags_obj.enable_xla)
 
-  dtype = flags_core.get_tf_dtype(flags_obj)
-
   # TODO(anj-s): Set data_format without using Keras.
   data_format = flags_obj.data_format
   if data_format is None:
@@ -167,12 +164,20 @@ def run(flags_obj):
   with strategy_scope:
     model = resnet_model.resnet50(
         num_classes=imagenet_preprocessing.NUM_CLASSES,
-        dtype=dtype, batch_size=flags_obj.batch_size,
+        batch_size=flags_obj.batch_size,
         use_l2_regularizer=not flags_obj.single_l2_loss_op)
 
     optimizer = tf.keras.optimizers.SGD(
         learning_rate=common.BASE_LEARNING_RATE, momentum=0.9,
         nesterov=True)
+
+    if flags_obj.fp16_implementation == "graph_rewrite":
+      if not flags_obj.use_tf_function:
+        raise ValueError("--fp16_implementation=graph_rewrite requires "
+                         "--use_tf_function to be true")
+      loss_scale = flags_core.get_loss_scale(flags_obj, default_for_fp16=128)
+      optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+          optimizer, loss_scale)
 
     training_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
         'training_accuracy', dtype=tf.float32)
@@ -206,7 +211,17 @@ def run(flags_obj):
             loss += (l2_loss / num_replicas)
           else:
             loss += (tf.reduce_sum(model.losses) / num_replicas)
+
+          # Scale the loss
+          if flags_obj.dtype == "fp16":
+            loss = optimizer.get_scaled_loss(loss)
+
         grads = tape.gradient(loss, trainable_variables)
+
+        # Unscale the grads
+        if flags_obj.dtype == "fp16":
+          grads = optimizer.get_unscaled_gradients(grads)
+
         optimizer.apply_gradients(zip(grads, trainable_variables))
 
         training_accuracy.update_state(labels, logits)
@@ -248,7 +263,7 @@ def run(flags_obj):
       training_accuracy.reset_states()
 
       for step in range(train_steps):
-        optimizer.lr = resnet_imagenet_main.learning_rate_schedule(
+        optimizer.lr = common.learning_rate_schedule(
             epoch, step, train_steps, flags_obj.batch_size)
 
         time_callback.on_batch_begin(step+epoch*train_steps)
@@ -299,6 +314,5 @@ if __name__ == '__main__':
   logging.set_verbosity(logging.INFO)
   common.define_keras_flags()
   ctl_common.define_ctl_flags()
-  flags.adopt_module_key_flags(keras_common)
   flags.adopt_module_key_flags(ctl_common)
   absl_app.run(main)

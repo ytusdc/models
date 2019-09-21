@@ -25,12 +25,10 @@ from __future__ import print_function
 import os
 import tempfile
 
-from absl import app as absl_app  # pylint: disable=unused-import
+from absl import app
 from absl import flags
 from absl import logging
 import tensorflow as tf
-
-from tensorflow.python.util import object_identity
 
 # pylint: disable=g-bad-import-order
 from official.transformer import compute_bleu
@@ -146,7 +144,6 @@ class TransformerTask(object):
 
     params["num_gpus"] = num_gpus
     params["use_ctl"] = flags_obj.use_ctl
-    params["is_tpu_pod"] = flags_obj.is_tpu_pod
     params["data_dir"] = flags_obj.data_dir
     params["model_dir"] = flags_obj.model_dir
     params["static_batch"] = flags_obj.static_batch
@@ -168,9 +165,11 @@ class TransformerTask(object):
       # like this. What if multiple instances of TransformerTask are created?
       # We should have a better way in the tf.keras.mixed_precision API of doing
       # this.
-      policy = tf.keras.mixed_precision.experimental.Policy(
-          "infer_float32_vars")
-      tf.keras.mixed_precision.experimental.set_policy(policy)
+      loss_scale = flags_core.get_loss_scale(flags_obj,
+                                             default_for_fp16="dynamic")
+      policy = tf.compat.v2.keras.mixed_precision.experimental.Policy(
+          "mixed_float16", loss_scale=loss_scale)
+      tf.compat.v2.keras.mixed_precision.experimental.set_policy(policy)
 
     self.distribution_strategy = distribution_utils.get_distribution_strategy(
         distribution_strategy=flags_obj.distribution_strategy,
@@ -181,13 +180,13 @@ class TransformerTask(object):
       if not params["static_batch"]:
         raise ValueError("TPU requires static batch for input data.")
     else:
-      print("Running transformer with num_gpus =", num_gpus)
+      logging.info("Running transformer with num_gpus = %d", num_gpus)
 
     if self.distribution_strategy:
-      print("For training, using distribution strategy: ",
-            self.distribution_strategy)
+      logging.info("For training, using distribution strategy: %s",
+                   self.distribution_strategy)
     else:
-      print("Not using any distribution strategy.")
+      logging.info("Not using any distribution strategy.")
 
   @property
   def use_tpu(self):
@@ -208,6 +207,15 @@ class TransformerTask(object):
     with distribution_utils.get_strategy_scope(self.distribution_strategy):
       model = transformer.create_model(params, is_train=True)
       opt = self._create_optimizer()
+
+      current_step = 0
+      checkpoint = tf.train.Checkpoint(model=model, optimizer=opt)
+      latest_checkpoint = tf.train.latest_checkpoint(flags_obj.model_dir)
+      if latest_checkpoint:
+        checkpoint.restore(latest_checkpoint)
+        logging.info("Loaded checkpoint %s", latest_checkpoint)
+        current_step = opt.iterations.numpy()
+
       if params["use_ctl"]:
         train_loss_metric = tf.keras.metrics.Mean(
             "training_loss", dtype=tf.float32)
@@ -224,7 +232,7 @@ class TransformerTask(object):
       train_ds = (
           self.distribution_strategy
           .experimental_distribute_datasets_from_function(
-              lambda ctx: data_pipeline.train_input_fn(params)))
+              lambda ctx: data_pipeline.train_input_fn(params, ctx)))
     else:
       train_ds = data_pipeline.train_input_fn(params)
       map_data_fn = data_pipeline.map_data_for_transformer_fn
@@ -261,8 +269,7 @@ class TransformerTask(object):
           scaled_loss = loss / self.distribution_strategy.num_replicas_in_sync
 
         # De-dupes variables due to keras tracking issues.
-        tvars = list(
-            object_identity.ObjectIdentitySet(model.trainable_variables))
+        tvars = list({id(v): v for v in model.trainable_variables}.values())
         grads = tape.gradient(scaled_loss, tvars)
         opt.apply_gradients(zip(grads, tvars))
         # For reporting, the metric takes the mean of losses.
@@ -273,40 +280,34 @@ class TransformerTask(object):
         self.distribution_strategy.experimental_run_v2(
             _step_fn, args=(next(iterator),))
 
-    if self.use_tpu:
-      checkpoint = tf.train.Checkpoint(model=model, optimizer=opt)
-      latest_checkpoint = tf.train.latest_checkpoint(flags_obj.model_dir)
-      if latest_checkpoint:
-        checkpoint.restore(latest_checkpoint)
-        logging.info("Loaded checkpoint %s", latest_checkpoint)
-
-    if flags_obj.train_steps < flags_obj.steps_between_evals:
-      flags_obj.steps_between_evals = flags_obj.train_steps
-    iterations = flags_obj.train_steps // flags_obj.steps_between_evals
-
     cased_score, uncased_score = None, None
     cased_score_history, uncased_score_history = [], []
-    for i in range(1, iterations + 1):
-      print("Start train iteration:{}/{}".format(i, iterations))
+    while current_step < flags_obj.train_steps:
+      remaining_steps = flags_obj.train_steps - current_step
+      train_steps_per_eval = (
+          remaining_steps if remaining_steps < flags_obj.steps_between_evals
+          else flags_obj.steps_between_evals)
+      current_iteration = current_step // flags_obj.steps_between_evals
+
+      logging.info(
+          "Start train iteration at global step:{}".format(current_step))
       history = None
       if params["use_ctl"]:
         if not self.use_tpu:
           raise NotImplementedError(
               "Custom training loop on GPUs is not implemented.")
-        train_steps_per_eval = tf.convert_to_tensor(
-            flags_obj.steps_between_evals, dtype=tf.int32)
-
         # Runs training steps.
-        train_steps(train_ds_iterator, train_steps_per_eval)
+        train_steps(train_ds_iterator,
+                    tf.convert_to_tensor(train_steps_per_eval, dtype=tf.int32))
+        current_step += train_steps_per_eval
         train_loss = train_loss_metric.result().numpy().astype(float)
         logging.info("Train Step: %d/%d / loss = %s",
-                     i * flags_obj.steps_between_evals, flags_obj.train_steps,
-                     train_loss)
+                     current_step, flags_obj.train_steps, train_loss)
 
         checkpoint_name = checkpoint.save(
             os.path.join(
                 flags_obj.model_dir,
-                "ctl_step_{}.ckpt".format(i * flags_obj.steps_between_evals)))
+                "ctl_step_{}.ckpt".format(current_step)))
         logging.info("Saved checkpoint to %s", checkpoint_name)
       else:
         if self.use_tpu:
@@ -314,24 +315,22 @@ class TransformerTask(object):
               "Keras model.fit on TPUs is not implemented.")
         history = model.fit(
             train_ds,
-            initial_epoch=i - 1,
-            epochs=i,
-            steps_per_epoch=flags_obj.steps_between_evals,
+            initial_epoch=current_iteration,
+            epochs=current_iteration + 1,
+            steps_per_epoch=train_steps_per_eval,
             callbacks=callbacks,
             # If TimeHistory is enabled, progress bar would be messy. Increase
             # the verbose level to get rid of it.
             verbose=(2 if flags_obj.enable_time_history else 1))
+        current_step += train_steps_per_eval
         logging.info("Train history: {}".format(history.history))
 
-      print("End train iteration:{}/{} global step:{}".format(
-          i,
-          iterations,
-          i*flags_obj.steps_between_evals))
+      logging.info("End train iteration at global step:{}".format(current_step))
 
       if (flags_obj.bleu_source and flags_obj.bleu_ref):
         uncased_score, cased_score = self.eval()
-        cased_score_history.append([i, cased_score])
-        uncased_score_history.append([i, uncased_score])
+        cased_score_history.append([current_iteration + 1, cased_score])
+        uncased_score_history.append([current_iteration + 1, uncased_score])
 
     stats = ({
         "loss": train_loss
@@ -345,12 +344,13 @@ class TransformerTask(object):
 
   def eval(self):
     """Evaluates the model."""
-    if not self.predict_model:
-      self.predict_model = transformer.create_model(self.params, False)
-    self._load_weights_if_possible(
-        self.predict_model,
-        tf.train.latest_checkpoint(self.flags_obj.model_dir))
-    self.predict_model.summary()
+    with distribution_utils.get_strategy_scope(self.distribution_strategy):
+      if not self.predict_model:
+        self.predict_model = transformer.create_model(self.params, False)
+      self._load_weights_if_possible(
+          self.predict_model,
+          tf.train.latest_checkpoint(self.flags_obj.model_dir))
+      self.predict_model.summary()
     return evaluate_and_log_bleu(
         self.predict_model, self.params, self.flags_obj.bleu_source,
         self.flags_obj.bleu_ref, self.flags_obj.vocab_file,
@@ -402,7 +402,7 @@ class TransformerTask(object):
       else:
         model.load_weights(init_weight_path)
     else:
-      print("Weights not loaded from path:{}".format(init_weight_path))
+      logging.info("Weights not loaded from path:{}".format(init_weight_path))
 
   def _create_optimizer(self):
     """Creates optimizer."""
@@ -417,10 +417,19 @@ class TransformerTask(object):
         params["optimizer_adam_beta1"],
         params["optimizer_adam_beta2"],
         epsilon=params["optimizer_adam_epsilon"])
+
     if params["dtype"] == tf.float16:
       opt = tf.keras.mixed_precision.experimental.LossScaleOptimizer(
           opt, loss_scale=flags_core.get_loss_scale(self.flags_obj,
                                                     default_for_fp16="dynamic"))
+    if self.flags_obj.fp16_implementation == "graph_rewrite":
+      # Note: when flags_obj.fp16_implementation == "graph_rewrite", dtype as
+      # determined by flags_core.get_tf_dtype(flags_obj) would be 'float32'
+      # which will ensure tf.compat.v2.keras.mixed_precision and
+      # tf.train.experimental.enable_mixed_precision_graph_rewrite do not double
+      # up.
+      opt = tf.train.experimental.enable_mixed_precision_graph_rewrite(opt)
+
     return opt
 
 
@@ -445,7 +454,7 @@ def main(_):
       else:
         raise ValueError("Invalid mode {}".format(flags_obj.mode))
 
-    if not flags_obj.distribution_strategy != "tpu":
+    if flags_obj.distribution_strategy != "tpu":
       _run_task(task)
     else:
       primary_cpu_task = "/job:worker" if flags_obj.use_tpu_2vm_config else ""
@@ -454,6 +463,7 @@ def main(_):
 
 
 if __name__ == "__main__":
+  tf.compat.v1.enable_v2_behavior()
   logging.set_verbosity(logging.INFO)
   misc.define_transformer_flags()
-  absl_app.run(main)
+  app.run(main)
